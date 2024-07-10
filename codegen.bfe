@@ -1,0 +1,954 @@
+%{
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <stdbool.h>
+#include <stdarg.h>
+#include "codegen.h"
+#include "util.h"
+
+typedef struct tree *NODEPTR_TYPE;
+#define OP_LABEL(p) ((p)->op)
+#define LEFT_CHILD(p) ((p)->left)
+#define RIGHT_CHILD(p) ((p)->right)
+#define STATE_LABEL(p) ((p)->state)
+#define PANIC(...) do { fprintf(stderr, __VA_ARGS__); exit(9); } while(0)
+
+#define ASM(format, ...) printf("\t"format"\n", ##__VA_ARGS__)
+
+enum reg {
+    RDI,
+    RSI,
+    RDX,
+    RCX,
+    R8,
+    R9,
+    R10,
+    R11,
+    RAX,
+    REGISTER_COUNT,
+    ANY_REGISTER         = REGISTER_COUNT,
+    FIRST_PARAM_REGISTER = RDI,
+    LAST_PARAM_REGISTER  = R9,
+};
+static char const *const REGISTER_NAMES[REGISTER_COUNT] = {
+    "%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9", "%r10", "%r11", "%rax",
+};
+
+enum {
+    EXPRFLAG_TEMP     = 1 << 0,
+    EXPRFLAG_VARIABLE = 1 << 1,
+    EXPRFLAG_MEMBER   = 1 << 2,
+
+    EXPRFLAG_REGISTER = 1 << 8,
+};
+
+struct expr {
+    enum expr_type {
+        EXPR_IMMEDIATE         = 0,
+        EXPR_TEMP_REGISTER     = EXPRFLAG_TEMP | EXPRFLAG_REGISTER,
+        EXPR_VARIABLE_REGISTER = EXPRFLAG_VARIABLE | EXPRFLAG_REGISTER,
+        EXPR_MEMBER_REGISTER   = EXPRFLAG_MEMBER | EXPRFLAG_REGISTER,
+        EXPR_MEMBER_SAVED      = EXPRFLAG_MEMBER,
+    } type;
+    enum reg reg;
+    int offset; // Offset in bytes for an object variable, or stack offset.
+    long value;
+    char const *varname; // Used for variable resolution during code generation.
+};
+
+struct tree {
+    enum op op;
+    enum reg preferred_reg;
+    struct tree *left;
+    struct tree *right;
+    struct burm_state *state; // Used by iburg
+    struct expr *expr;
+    struct expr _expr_struct;
+};
+
+struct reduced {
+    bool is_immediate;
+    bool is_temp;
+    enum reg reg;
+    long value;
+};
+
+enum {
+    MAX_VARIABLES = 64,
+    MAX_METHODS   = 64,
+};
+
+struct scope {
+    struct expr variables[MAX_VARIABLES];
+    int num_variables;
+    struct reginfo { struct expr *owner; } regs[REGISTER_COUNT];
+    struct expr *thisptr;
+    char const *class_name;
+    long cond_id;
+    bool unreachable;
+    struct scope *next;
+};
+
+static char const *method_table[MAX_METHODS];
+static struct scope *scope = NULL;
+static long next_id = 0;
+
+static enum reg getfreereg(void);
+static void freereg(enum reg reg);
+static void movetoreg(struct expr *e);
+static void movetoreg2(struct expr *e, enum reg);
+
+static void assign_temp_register(struct tree *bnode);
+static struct expr *choose_unary_operator_destination(struct tree *bnode, struct expr *left);
+static struct expr *choose_binary_operator_destination(struct tree *bnode, struct expr *left, struct expr *right);
+static void asm_not(struct tree *bnode, struct expr *left);
+static void asm_negate(struct tree *bnode, struct expr *left);
+static void asm_add_expr_expr_imm(struct tree *bnode, struct expr *left, struct expr *right, long value);
+static void asm_add_expr_imm(struct tree *bnode, struct expr *left, long value);
+static void asm_mul_expr_expr_imm(struct tree *bnode, struct expr *left, struct expr *right, long value);
+static void asm_mul_expr_imm(struct tree *bnode, struct expr *left, long value);
+static void asm_or_expr_expr_imm(struct tree *bnode, struct expr *left, struct expr *right, long value);
+static void asm_or_expr_imm(struct tree *bnode, struct expr *left, long value);
+static void asm_and_expr_expr(struct tree *bnode, struct expr *left, struct expr *right);
+static void asm_greater(struct tree *bnode, struct expr *left, struct expr *right);
+static void asm_not_equal(struct tree *bnode, struct expr *left, struct expr *right);
+static void asm_new(struct tree *bnode);
+static void asm_call(struct tree *bnode);
+
+static int get_method_offset(char const *method_name);
+static struct expr *get_variable_by_name(char const *name);
+static struct tree *resolve_variables(struct tree *);
+static void set_preferred_register(struct tree *, enum reg preferred_reg);
+static bool has_function_calls(struct tree *);
+static struct reduced reduce_tree(struct tree *t, enum reg prefreg);
+static void copy_reduced_into_register(struct reduced reduced, enum reg dest);
+static void copy_reduced_into_memory(struct reduced reduced, enum reg base, int offset);
+static void push_scope(void);
+static void pop_scope(void);
+static void generate_class_table(struct symtable const *isym, char const *name, struct symtable const *implemented_methods);
+
+%}
+
+%term Immediate = 1
+%term Register = 2
+%term Memory = 3
+%term Not = 4
+%term Negate = 5
+%term Add = 6
+%term Multiply = 7
+%term Or = 8
+%term Greater = 9
+%term NotEqual = 10
+%term New = 11
+%term Param = 12
+%term Call = 13
+
+%%
+
+start: reg
+start: imm
+start: Immediate
+start: Register
+start: Memory
+
+reg: Not(reg)           # 1 # asm_not(bnode, kids[0]->expr);
+reg: Negate(reg)        # 1 # asm_negate(bnode, kids[0]->expr);
+reg: Add(reg, reg)      # 1 # asm_add_expr_expr_imm(bnode, kids[0]->expr, kids[1]->expr, 0);
+reg: Multiply(reg, reg) # 2 # asm_mul_expr_expr_imm(bnode, kids[0]->expr, kids[1]->expr, 1);
+reg: Or(reg, reg)       # 2 # asm_or_expr_expr_imm(bnode, kids[0]->expr, kids[1]->expr, 0);
+reg: Greater(reg, reg)  # 3 # asm_greater(bnode, kids[0]->expr, kids[1]->expr);
+reg: NotEqual(reg, reg) # 3 # asm_not_equal(bnode, kids[0]->expr, kids[1]->expr);
+reg: New                # 1 # asm_new(bnode);
+reg: Call               # 1 # asm_call(bnode);
+reg: Register           # 0
+reg: Memory             # 1 # movetoreg(bnode->expr);
+
+reg: lea2             # 1 # asm_add_expr_expr_imm(bnode, kids[0]->left->expr, kids[0]->right->expr, kids[0]->expr->value);
+reg: lea1             # 1 # asm_add_expr_imm(bnode, kids[0]->left->expr, kids[0]->expr->value);
+lea2: Add(lea2, imm)  # 0 # bnode->left = kids[0]->left; bnode->right = kids[0]->right; bnode->expr->value = kids[0]->expr->value + kids[1]->expr->value;
+lea2: Add(imm, lea2)  # 0 # bnode->left = kids[1]->left; bnode->right = kids[1]->right; bnode->expr->value = kids[0]->expr->value + kids[1]->expr->value;
+lea2: Add(lea1, lea1) # 0 # bnode->left = kids[0]->left; bnode->right = kids[1]->left; bnode->expr->value = kids[0]->expr->value + kids[1]->expr->value;
+lea1: Add(imm, lea1)  # 0 # bnode->left = kids[1]->left; bnode->expr->value = kids[0]->expr->value + kids[1]->expr->value;
+lea1: Add(lea1, imm)  # 0 # bnode->left = kids[0]->left; bnode->expr->value = kids[0]->expr->value + kids[1]->expr->value;
+lea1: reg             # 0 # bnode->left = kids[0]; bnode->expr->value = 0;
+
+reg: mult2                    # 2 # asm_mul_expr_expr_imm(bnode, kids[0]->left->expr, kids[0]->right->expr, kids[0]->expr->value);
+reg: mult1                    # 1 # asm_mul_expr_imm(bnode, kids[0]->left->expr, kids[0]->expr->value);
+mult2: Multiply(mult2, imm)   # 0 # bnode->left = kids[0]->left; bnode->right = kids[0]->right; bnode->expr->value = kids[0]->expr->value * kids[1]->expr->value;
+mult2: Multiply(imm, mult2)   # 0 # bnode->left = kids[1]->left; bnode->right = kids[1]->right; bnode->expr->value = kids[0]->expr->value * kids[1]->expr->value;
+mult2: Multiply(mult1, mult1) # 0 # bnode->left = kids[0]->left; bnode->right = kids[1]->left; bnode->expr->value = kids[0]->expr->value * kids[1]->expr->value;
+mult1: Multiply(imm, mult1)   # 0 # bnode->left = kids[1]->left; bnode->expr->value = kids[0]->expr->value * kids[1]->expr->value;
+mult1: Multiply(mult1, imm)   # 0 # bnode->left = kids[0]->left; bnode->expr->value = kids[0]->expr->value * kids[1]->expr->value;
+mult1: reg                    # 0 # bnode->left = kids[0]; bnode->expr->value = 1;
+
+reg: or         # 1 # asm_or_expr_imm(bnode, kids[0]->expr, kids[0]->expr->value);
+or: Or(or, or)  # 1 # asm_or_expr_expr_imm(bnode, kids[0]->expr, kids[1]->expr, 0); bnode->expr->value = kids[0]->expr->value | kids[1]->expr->value;
+or: Or(imm, or) # 0 # bnode->expr = kids[1]->expr; bnode->expr->value |= kids[0]->expr->value;
+or: Or(or, imm) # 0 # bnode->expr = kids[0]->expr; bnode->expr->value |= kids[1]->expr->value;
+or: reg         # 0 # bnode->expr->value = 0;
+
+reg: not                # 1 # asm_not(bnode, kids[0]->expr);
+reg: Not(not)           # 0 # bnode->expr = kids[0]->expr;
+reg: NotEqual(not, not) # 3 # asm_not_equal(bnode, kids[0]->expr, kids[1]->expr);
+not: Or(not, not)       # 1 # asm_and_expr_expr(bnode, kids[0]->expr, kids[1]->expr);
+not: Not(reg)           # 0 # bnode->expr = kids[0]->expr;
+
+reg: neg                # 1 # asm_negate(bnode, kids[0]->expr);
+reg: Negate(neg)        # 0 # bnode->expr = kids[0]->expr;
+reg: Multiply(neg, neg) # 1 # asm_mul_expr_expr_imm(bnode, kids[0]->expr, kids[1]->expr, 1);
+neg: Add(neg, neg)      # 1 # asm_add_expr_expr_imm(bnode, kids[0]->expr, kids[1]->expr, 0);
+neg: Negate(reg)        # 0 # bnode->expr = kids[0]->expr;
+
+reg: imm                # 1 # movetoreg(kids[0]->expr);
+imm: Not(imm)           # 0 # bnode->expr->value = ~kids[0]->expr->value;
+imm: Negate(imm)        # 0 # bnode->expr->value = -kids[0]->expr->value;
+imm: Add(imm, imm)      # 0 # bnode->expr->value = kids[0]->expr->value + kids[1]->expr->value;
+imm: Multiply(imm, imm) # 0 # bnode->expr->value = kids[0]->expr->value * kids[1]->expr->value;
+imm: Or(imm, imm)       # 0 # bnode->expr->value = kids[0]->expr->value | kids[1]->expr->value;
+imm: Greater(imm, imm)  # 0 # bnode->expr->value = -(kids[0]->expr->value > kids[1]->expr->value);
+imm: NotEqual(imm, imm) # 0 # bnode->expr->value = -(kids[0]->expr->value != kids[1]->expr->value);
+imm: Immediate
+
+%%
+
+static enum reg getfreereg(void) {
+    for (enum reg r = 0; r < REGISTER_COUNT; ++r) {
+        if (scope->regs[r].owner == NULL) {
+            return r;
+        }
+    }
+    assert(0 && "no registers: expression is too deep"); return 0;
+}
+
+static void freereg(enum reg reg) {
+    assert(reg >= 0 && reg < REGISTER_COUNT);
+    scope->regs[reg] = (struct reginfo) {0};
+}
+
+static void movetoreg(struct expr *e) {
+    assert(e != NULL);
+    switch (e->type) {
+    case EXPR_IMMEDIATE:
+    case EXPR_MEMBER_SAVED:
+        return movetoreg2(e, getfreereg());
+    case EXPR_TEMP_REGISTER:
+    case EXPR_VARIABLE_REGISTER:
+    case EXPR_MEMBER_REGISTER:
+        return;
+    }
+    assert(0 && "unreachable");
+}
+
+static void movetoreg2(struct expr *e, enum reg dest) {
+    assert(e != NULL && dest < REGISTER_COUNT);
+    switch (e->type) {
+    case EXPR_IMMEDIATE:
+        ASM("mov $%ld, %s", e->value, REGISTER_NAMES[dest]);
+        e->type = EXPR_TEMP_REGISTER;
+        e->reg = dest;
+        scope->regs[e->reg].owner = e;
+        return;
+    case EXPR_MEMBER_SAVED:
+        movetoreg(scope->thisptr);
+        e->reg = dest;
+        e->type = EXPR_MEMBER_REGISTER;
+        scope->regs[e->reg].owner = e;
+        ASM("mov %d(%s), %s", e->offset, REGISTER_NAMES[scope->thisptr->reg], REGISTER_NAMES[e->reg]);
+        return;
+    case EXPR_TEMP_REGISTER:
+    case EXPR_VARIABLE_REGISTER:
+    case EXPR_MEMBER_REGISTER:
+        if (e->reg == dest) {
+            return;
+        }
+        ASM("mov %s, %s", REGISTER_NAMES[e->reg], REGISTER_NAMES[dest]);
+        freereg(e->reg);
+        e->reg = dest;
+        scope->regs[e->reg].owner = e;
+        return;
+    }
+    assert(0 && "unreachable");
+}
+
+static void assign_temp_register(struct tree *bnode) {
+    enum reg reg;
+    enum reg preference = bnode->preferred_reg;
+    if (preference < REGISTER_COUNT && scope->regs[preference].owner == NULL) {
+        reg = preference;
+    } else {
+        reg = getfreereg();
+    }
+    bnode->_expr_struct = (struct expr) {
+        .type = EXPR_TEMP_REGISTER,
+        .reg  = reg,
+    };
+    bnode->expr = &bnode->_expr_struct,
+    scope->regs[bnode->expr->reg].owner = bnode->expr;
+}
+
+static struct expr *choose_unary_operator_destination(struct tree *bnode, struct expr *left) {
+    assert(bnode != NULL && left != NULL);
+    movetoreg(left);
+    if (left->type == EXPR_TEMP_REGISTER) {
+        bnode->expr = left;
+    } else {
+        assign_temp_register(bnode);
+    }
+    return bnode->expr;
+}
+
+static struct expr *choose_binary_operator_destination(struct tree *bnode, struct expr *left, struct expr *right) {
+    assert(bnode != NULL && left != NULL && right != NULL);
+    movetoreg(left);
+    movetoreg(right);
+    if (left->type == EXPR_TEMP_REGISTER && right->type == EXPR_TEMP_REGISTER) {
+        if (left == right) {
+            bnode->expr = left;
+        } else if (left->reg == bnode->preferred_reg) {
+            bnode->expr = left;
+            freereg(right->reg);
+        } else {
+            bnode->expr = right;
+            freereg(left->reg);
+        }
+    } else if (left->type == EXPR_TEMP_REGISTER) {
+        bnode->expr = left;
+    } else if (right->type == EXPR_TEMP_REGISTER) {
+        bnode->expr = right;
+    } else {
+        assign_temp_register(bnode);
+    }
+    return bnode->expr;
+}
+
+static void asm_not(struct tree *bnode, struct expr *left) {
+    struct expr *dest = choose_unary_operator_destination(bnode, left);
+    if (dest != left) {
+        ASM("mov %s, %s", REGISTER_NAMES[left->reg], REGISTER_NAMES[dest->reg]);
+    }
+    ASM("not %s", REGISTER_NAMES[dest->reg]);
+}
+
+static void asm_negate(struct tree *bnode, struct expr *left) {
+    struct expr *dest = choose_unary_operator_destination(bnode, left);
+    if (dest != left) {
+        ASM("mov %s, %s", REGISTER_NAMES[left->reg], REGISTER_NAMES[dest->reg]);
+    }
+    ASM("neg %s", REGISTER_NAMES[dest->reg]);
+}
+
+static void asm_add_expr_expr_imm(struct tree *bnode, struct expr *left, struct expr *right, long value) {
+    struct expr *dest = choose_binary_operator_destination(bnode, left, right);
+    if (value == 0) {
+        ASM("lea (%s, %s), %s", REGISTER_NAMES[left->reg], REGISTER_NAMES[right->reg], REGISTER_NAMES[dest->reg]);
+    } else {
+        ASM("lea %ld(%s, %s), %s", value, REGISTER_NAMES[left->reg], REGISTER_NAMES[right->reg], REGISTER_NAMES[dest->reg]);
+    }
+}
+
+static void asm_add_expr_imm(struct tree *bnode, struct expr *left, long value) {
+    struct expr *dest = choose_unary_operator_destination(bnode, left);
+    ASM("lea %ld(%s), %s", value, REGISTER_NAMES[left->reg], REGISTER_NAMES[dest->reg]);
+}
+
+static void asm_mul_expr_expr_imm(struct tree *bnode, struct expr *left, struct expr *right, long value) {
+    struct expr *dest = choose_binary_operator_destination(bnode, left, right);
+    if (value == 0) {
+        ASM("xor %s, %s", REGISTER_NAMES[dest->reg], REGISTER_NAMES[dest->reg]);
+    } else if (value == 1) {
+         if (dest == left) {
+            ASM("imul %s, %s", REGISTER_NAMES[right->reg], REGISTER_NAMES[dest->reg]);
+        } else if (dest == right) {
+            ASM("imul %s, %s", REGISTER_NAMES[left->reg], REGISTER_NAMES[dest->reg]);
+        } else {
+            ASM("mov %s, %s", REGISTER_NAMES[left->reg], REGISTER_NAMES[dest->reg]);
+            ASM("imul %s, %s", REGISTER_NAMES[right->reg], REGISTER_NAMES[dest->reg]);
+        }
+    } else {
+        if (dest == left) {
+            ASM("imul %s, %s", REGISTER_NAMES[right->reg], REGISTER_NAMES[dest->reg]);
+            ASM("imul $%ld, %s", value, REGISTER_NAMES[dest->reg]);
+        } else if (dest == right) {
+            ASM("imul %s, %s", REGISTER_NAMES[left->reg], REGISTER_NAMES[dest->reg]);
+            ASM("imul $%ld, %s", value, REGISTER_NAMES[dest->reg]);
+        } else {
+            ASM("imul $%ld, %s, %s", value, REGISTER_NAMES[left->reg], REGISTER_NAMES[dest->reg]);
+            ASM("imul %s, %s", REGISTER_NAMES[right->reg], REGISTER_NAMES[dest->reg]);
+        }
+    }
+}
+
+static void asm_mul_expr_imm(struct tree *bnode, struct expr *left, long value) {
+    struct expr *dest = choose_unary_operator_destination(bnode, left);
+    ASM("imul $%ld, %s, %s", value, REGISTER_NAMES[left->reg], REGISTER_NAMES[dest->reg]);
+}
+
+static void asm_or_expr_expr_imm(struct tree *bnode, struct expr *left, struct expr *right, long value) {
+    struct expr *dest = choose_binary_operator_destination(bnode, left, right);
+    if (value == -1) {
+        ASM("mov $-1, %s", REGISTER_NAMES[dest->reg]);
+    } else {
+        if (dest == left) {
+            ASM("or %s, %s", REGISTER_NAMES[right->reg], REGISTER_NAMES[dest->reg]);
+        } else if (dest == right) {
+            ASM("or %s, %s", REGISTER_NAMES[left->reg], REGISTER_NAMES[dest->reg]);
+        } else {
+            ASM("mov %s, %s", REGISTER_NAMES[left->reg], REGISTER_NAMES[dest->reg]);
+            ASM("or %s, %s", REGISTER_NAMES[right->reg], REGISTER_NAMES[dest->reg]);
+        }
+        if (value != 0) {
+            ASM("or $%ld, %s", value, REGISTER_NAMES[dest->reg]);
+        }
+    }
+}
+
+static void asm_or_expr_imm(struct tree *bnode, struct expr *left, long value) {
+    struct expr *dest = choose_unary_operator_destination(bnode, left);
+    if (value == -1) {
+        ASM("mov $-1, %s", REGISTER_NAMES[dest->reg]);
+    } else {
+        if (dest != left) {
+            ASM("mov %s, %s", REGISTER_NAMES[left->reg], REGISTER_NAMES[dest->reg]);
+        }
+        if (value != 0) {
+            ASM("or $%ld, %s", value, REGISTER_NAMES[dest->reg]);
+        }
+    }
+}
+
+static void asm_and_expr_expr(struct tree *bnode, struct expr *left, struct expr *right) {
+    struct expr *dest = choose_binary_operator_destination(bnode, left, right);
+    if (dest == left) {
+        ASM("and %s, %s", REGISTER_NAMES[right->reg], REGISTER_NAMES[dest->reg]);
+    } else if (dest == right) {
+        ASM("and %s, %s", REGISTER_NAMES[left->reg], REGISTER_NAMES[dest->reg]);
+    } else {
+        ASM("mov %s, %s", REGISTER_NAMES[left->reg], REGISTER_NAMES[dest->reg]);
+        ASM("and %s, %s", REGISTER_NAMES[right->reg], REGISTER_NAMES[dest->reg]);
+    }
+}
+
+static void asm_greater(struct tree *bnode, struct expr *left, struct expr *right) {
+    struct expr *dest = choose_binary_operator_destination(bnode, left, right);
+    if (left == right) {
+        ASM("xor %s, %s", REGISTER_NAMES[dest->reg], REGISTER_NAMES[dest->reg]);
+    } else {
+        ASM("cmp %s, %s", REGISTER_NAMES[right->reg], REGISTER_NAMES[left->reg]);
+        ASM("mov $0, %s", REGISTER_NAMES[dest->reg]);
+        ASM("cmovg .minus_one(%%rip), %s", REGISTER_NAMES[dest->reg]);
+    }
+}
+
+static void asm_not_equal(struct tree *bnode, struct expr *left, struct expr *right) {
+    struct expr *dest = choose_binary_operator_destination(bnode, left, right);
+    if (left == right) {
+        ASM("xor %s, %s", REGISTER_NAMES[dest->reg], REGISTER_NAMES[dest->reg]);
+    } else {
+        ASM("cmp %s, %s", REGISTER_NAMES[right->reg], REGISTER_NAMES[left->reg]);
+        ASM("mov $0, %s", REGISTER_NAMES[dest->reg]);
+        ASM("cmovne .minus_one(%%rip), %s", REGISTER_NAMES[dest->reg]);
+    }
+}
+
+static void asm_new(struct tree *bnode) {
+    char const *class_name = bnode->expr->varname;
+    int num_members = (int) bnode->expr->value;
+    assert(class_name != NULL && num_members >= 0);
+
+    assign_temp_register(bnode);
+    ASM("movq $%s, (%%r15)", class_name);
+    for (int i = 0; i < num_members; ++i) {
+        ASM("movq $0, %d(%%r15)", 8 * (i + 1));
+    }
+    ASM("mov %%r15, %s", REGISTER_NAMES[bnode->expr->reg]);
+    ASM("add $%d, %%r15", 8 * (num_members + 1));
+}
+
+static void asm_call(struct tree *bnode) {
+    // Reduce function parameters
+    int num_params = 0;
+    struct reduced params[16] = {0};
+    for (struct tree *p = bnode->left; p != NULL; p = p->right) {
+        assert(p->op == OP_PARAM);
+        enum reg preference = FIRST_PARAM_REGISTER + num_params;
+        params[num_params++] = reduce_tree(p->left, preference);
+    }
+
+    // Save call-clobbered registers
+    bool must_save[REGISTER_COUNT] = {0};
+    for (int r = 0; r < REGISTER_COUNT; ++r) {
+        must_save[r] = scope->regs[r].owner != NULL;
+    }
+    for (int i = 0; i < num_params; ++i) {
+        if (params[i].is_temp) {
+            must_save[params[i].reg] = false;
+        }
+    }
+    for (int r = 0; r < REGISTER_COUNT; ++r) {
+        if (must_save[r]) {
+            ASM("pushq %s", REGISTER_NAMES[r]);
+        }
+    }
+
+    // Copy reduced expressions into the correct registers (topological sort).
+    int usages[REGISTER_COUNT] = {0};
+    bool assigned[REGISTER_COUNT] = {0};
+    for (int i = 0; i < num_params; ++i) {
+        if (!params[i].is_immediate) {
+            assigned[i] = (int) params[i].reg == i;
+            ++usages[params[i].reg];
+        }
+    }
+    while (true) {
+        bool cycle = true;
+        int last_unassigned = -1;
+        for (int r = 0; r < num_params; ++r) {
+            if (assigned[r]) {
+                continue;
+            }
+            if (usages[r] == 0) {
+                copy_reduced_into_register(params[r], r);
+                assigned[r] = true;
+                if (!params[r].is_immediate) {
+                    --usages[params[r].reg];
+                }
+                cycle = false;
+            } else {
+                last_unassigned = r;
+            }
+        }
+        if (last_unassigned < 0) {
+            // All reduced expressions are assigned to correct registers.
+            break;
+        }
+        if (cycle) {
+            // We have a cycle in the register assignment.
+            assert(!params[last_unassigned].is_immediate);
+            enum reg prev = params[last_unassigned].reg;
+            enum reg curr = getfreereg();
+            --usages[prev];
+            ++usages[curr];
+            copy_reduced_into_register(params[last_unassigned], curr);
+            params[last_unassigned].reg = curr;
+        }
+    }
+
+    // Finally lookup the desired function and call it.
+    ASM("movq (%s), %%rax", REGISTER_NAMES[FIRST_PARAM_REGISTER]);
+    ASM("call *%d(%%rax)", get_method_offset(bnode->expr->varname));
+    assign_temp_register(bnode);
+    if (bnode->expr->reg != RAX) {
+        ASM("mov %%rax, %s", REGISTER_NAMES[bnode->expr->reg]);
+    }
+
+    // Restore registers
+    for (int r = REGISTER_COUNT; r-- > 0;) {
+        if (must_save[r]) {
+            ASM("popq %s", REGISTER_NAMES[r]);
+        }
+    }
+}
+
+static int get_method_offset(char const *method_name) {
+    for (int i = 0; i < MAX_METHODS && method_table[i] != NULL; ++i) {
+        if (strcmp(method_table[i], method_name) == 0) {
+            return i * 8;
+        }
+    }
+    assert(0 && "unreachable: cannot find method"); return 0;
+}
+
+static struct expr *get_variable_by_name(char const *name) {
+    for (int i = 0; i < scope->num_variables; ++i) {
+        if (strcmp(scope->variables[i].varname, name) == 0) {
+            return &scope->variables[i];
+        }
+    }
+    assert(0 && "unreachable: non-existent symbol"); return NULL;
+}
+
+static struct tree *resolve_variables(struct tree *t) {
+    assert(t != NULL && t->expr != NULL);
+    if (t->op == 0) { // 0 is used to indicate unresolved variables.
+        struct expr *var = get_variable_by_name(t->expr->varname);
+        if (var->type & EXPRFLAG_REGISTER) {
+            t->op = OP_REGISTER;
+        } else {
+            t->op = OP_MEMORY;
+        }
+        t->expr = var;
+        return t;
+    }
+    if (t->left != NULL) {
+        t->left = resolve_variables(t->left);
+    }
+    if (t->right != NULL) {
+        t->right = resolve_variables(t->right);
+    }
+    return t;
+}
+
+static void set_preferred_register(struct tree *t, enum reg preferred_reg) {
+    t->preferred_reg = preferred_reg;
+    if (t->left != NULL) {
+        set_preferred_register(t->left, preferred_reg);
+    }
+    if (t->right != NULL) {
+        set_preferred_register(t->right, preferred_reg);
+    }
+}
+
+static bool has_function_calls(struct tree *t) {
+    assert(t != NULL);
+    return t->op == OP_CALL
+        || (t->left != NULL && has_function_calls(t->left))
+        || (t->right != NULL && has_function_calls(t->right));
+}
+
+static struct reduced reduce_tree(struct tree *t, enum reg prefreg) {
+    assert(t != NULL && (prefreg < REGISTER_COUNT || prefreg == ANY_REGISTER));
+    struct burm_state *burm_label(struct tree *);
+    void burm_reduce(struct tree *bnode, int goalnt);
+
+    t = resolve_variables(t);
+    set_preferred_register(t, prefreg);
+    burm_label(t);
+    burm_reduce(t, 1);
+
+    switch (t->expr->type) {
+    case EXPR_IMMEDIATE:
+        return (struct reduced) { .is_immediate = true, .value = t->expr->value };
+    case EXPR_TEMP_REGISTER:
+        return (struct reduced) { .is_temp = true, .reg = t->expr->reg };
+    case EXPR_MEMBER_SAVED:
+        movetoreg(t->expr);
+        /* fallthrough */
+    case EXPR_VARIABLE_REGISTER:
+    case EXPR_MEMBER_REGISTER:
+        return (struct reduced) { .reg = t->expr->reg };
+    }
+    assert(0 && "unreachable"); return (struct reduced) {0};
+}
+
+static void copy_reduced_into_register(struct reduced reduced, enum reg dest){
+    if (reduced.is_immediate) {
+        ASM("mov $%ld, %s", reduced.value, REGISTER_NAMES[dest]);
+    } else if (reduced.reg != dest) {
+        ASM("mov %s, %s", REGISTER_NAMES[reduced.reg], REGISTER_NAMES[dest]);
+    }
+    if (reduced.is_temp) {
+        freereg(reduced.reg);
+    }
+}
+
+static void copy_reduced_into_memory(struct reduced reduced, enum reg base, int offset) {
+    if (reduced.is_immediate) {
+        ASM("movq $%ld, %d(%s)", reduced.value, offset, REGISTER_NAMES[base]);
+    } else {
+        ASM("movq %s, %d(%s)", REGISTER_NAMES[reduced.reg], offset, REGISTER_NAMES[base]);
+    }
+    if (reduced.is_temp) {
+        freereg(reduced.reg);
+    }
+}
+
+static void push_scope(void) {
+    struct scope *s = xalloc(sizeof(*s));
+
+    if (scope != NULL) {
+        memcpy(s, scope, sizeof(*scope));
+        s->next = scope;
+
+        for (enum reg r = 0; r < REGISTER_COUNT; ++r) {
+            if (scope->regs[r].owner == NULL) {
+                continue;
+            }
+            int i = 0;
+            for (; i < scope->num_variables; ++i) {
+                if (scope->regs[r].owner == &scope->variables[i]) {
+                    s->regs[r].owner = &s->variables[i];
+                    break;
+                }
+            }
+            assert(i < scope->num_variables);
+        }
+        for (int i = 0; i < scope->num_variables; ++i) {
+            if (scope->thisptr == &scope->variables[i]) {
+                s->thisptr = &s->variables[i];
+                break;
+            }
+        }
+    }
+    scope = s;
+}
+
+static void pop_scope(void) {
+    assert(scope != NULL);
+    struct scope *next = scope->next;
+    free(scope);
+    scope = next;
+}
+
+static void generate_class_table(struct symtable const *isym, char const *name, struct symtable const *implemented_methods) {
+    printf("\t.data\n");
+    printf("\t.global %s\n", name);
+    printf("%s:\n", name);
+
+    FOREACH_SYMBOL (selector, isym) {
+        assert(selector->name != NULL);
+        if (selector->symtype != SYMTYPE_FUNCTION) {
+            continue;
+        }
+
+        bool implemented = false;
+        FOREACH_SYMBOL (method, implemented_methods) {
+            assert(method->name != NULL && method->symtype == SYMTYPE_FUNCTION);
+            if (strcmp(selector->name, method->name) == 0) {
+                implemented = true;
+                break;
+            }
+        }
+
+        if (implemented) {
+            printf("\t.quad %s.%s\n", name, selector->name);
+        } else {
+            printf("\t.quad 0\n");
+        }
+    }
+    printf("\n");
+}
+
+void codegen_begin_class(struct symtable const *isym, char const *name, struct symtable const *members, struct symtable const *methods) {
+    assert(scope == NULL && name != NULL);
+    push_scope();
+    scope->class_name = name;
+
+    static bool first_class = true;
+    if (first_class) {
+        first_class = false;
+        printf("\t.data\n");
+        printf(".minus_one:\n");
+        printf("\t.quad -1\n\n");
+
+        int i = 0;
+        FOREACH_SYMBOL (selector, isym) {
+            if (selector->symtype != SYMTYPE_FUNCTION) {
+                continue;
+            }
+            assert(selector->name != NULL);
+            method_table[i++] = xstrdup(selector->name);
+        }
+    }
+
+    generate_class_table(isym, name, methods);
+
+    int offset = 0;
+    FOREACH_SYMBOL (member, members) {
+        assert(member->name != NULL && member->symtype == SYMTYPE_VARIABLE);
+        scope->variables[scope->num_variables] = (struct expr) {
+            .type    = EXPR_MEMBER_SAVED,
+            .offset  = (offset += 8),
+            .varname = member->name,
+        };
+        ++scope->num_variables;
+    }
+}
+
+void codegen_end_class(void) {
+    assert(scope != NULL && scope->next == NULL);
+    pop_scope();
+}
+
+void codegen_begin_method(char const *name, struct symtable const *params) {
+    assert(name != NULL && params != NULL);
+    assert(scope != NULL && scope->next == NULL);
+
+    push_scope();
+
+    printf("\t.text\n");
+    printf("\t.type %s.%s, @function\n", scope->class_name, name);
+    printf("%s.%s:\n", scope->class_name, name);
+
+    scope->thisptr = &scope->variables[scope->num_variables];
+
+    enum reg reg = FIRST_PARAM_REGISTER;
+    FOREACH_SYMBOL (param, params) {
+        assert(param->name != NULL && param->symtype == SYMTYPE_VARIABLE);
+        scope->variables[scope->num_variables] = (struct expr) {
+            .type    = EXPR_VARIABLE_REGISTER,
+            .reg     = reg,
+            .varname = param->name,
+        };
+        scope->regs[reg].owner = &scope->variables[scope->num_variables];
+        ++scope->num_variables;
+        ++reg;
+    }
+}
+
+void codegen_end_method(void) {
+    assert(scope != NULL && scope->next != NULL);
+    pop_scope();
+    printf("\n");
+}
+
+void codegen_begin_cond(void) {
+    for (int i = 0; i < scope->num_variables; ++i) {
+        if (scope->variables[i].type == EXPR_MEMBER_REGISTER) {
+            scope->variables[i].type = EXPR_MEMBER_SAVED;
+            freereg(scope->variables[i].reg);
+        }
+    }
+    push_scope();
+    scope->cond_id = next_id++;
+    printf("_cond_begin_%ld:\n", scope->cond_id);
+}
+
+void codegen_end_cond(void) {
+    printf("_cond_end_%ld:\n", scope->cond_id);
+    pop_scope();
+}
+
+void codegen_begin_guarded(struct tree *tree) {
+    push_scope();
+    struct reduced reduced = reduce_tree(tree, ANY_REGISTER);
+    if (reduced.is_immediate) {
+        if (reduced.value == 0) {
+            ASM("jmp %ldf", scope->cond_id);
+        }
+    } else {
+        ASM("test %s, %s", REGISTER_NAMES[reduced.reg], REGISTER_NAMES[reduced.reg]);
+        ASM("je %ldf", scope->cond_id);
+    }
+    if (reduced.is_temp) {
+        freereg(reduced.reg);
+    }
+}
+
+void codegen_end_guarded(enum guarded guarded) {
+    assert(guarded == GUARDED_BREAK || guarded == GUARDED_CONTINUE);
+    switch (guarded) {
+    case GUARDED_BREAK:
+        ASM("jmp _cond_end_%ld", scope->cond_id);
+        break;
+    case GUARDED_CONTINUE:
+        ASM("jmp _cond_begin_%ld", scope->cond_id);
+        break;
+    }
+    printf("%ld:\n", scope->cond_id);
+    pop_scope();
+}
+
+void codegen_generate_return_statement(struct tree *tree) {
+    if (scope->unreachable) {
+        return;
+    }
+    assert(scope->regs[RAX].owner == NULL);
+    copy_reduced_into_register(reduce_tree(tree, RAX), RAX);
+    ASM("ret");
+    scope->unreachable = true;
+}
+
+void codegen_generate_definition_statement(char const *name, struct tree *tree) {
+    if (scope->unreachable) {
+        return;
+    }
+
+    struct reduced reduced = reduce_tree(tree, ANY_REGISTER);
+    enum reg reg;
+    if (reduced.is_temp && reduced.reg != RAX) {
+        reg = reduced.reg;
+    } else {
+        reg = getfreereg();
+    }
+    copy_reduced_into_register(reduced, reg);
+
+    scope->variables[scope->num_variables] = (struct expr) {
+        .type    = EXPR_VARIABLE_REGISTER,
+        .reg     = reg,
+        .varname = name,
+    };
+    scope->regs[reg].owner = &scope->variables[scope->num_variables];
+    ++scope->num_variables;
+}
+
+void codegen_generate_assignment_statement(char const *name, struct tree *tree) {
+    if (scope->unreachable) {
+        return;
+    }
+
+    struct reduced reduced = reduce_tree(tree, ANY_REGISTER);
+    struct expr *var = get_variable_by_name(name);
+
+    switch (var->type) {
+    case EXPR_IMMEDIATE:
+    case EXPR_TEMP_REGISTER:
+        assert(0 && "unreachable");
+        break;
+    case EXPR_VARIABLE_REGISTER:
+        copy_reduced_into_register(reduced, var->reg);
+        break;
+    case EXPR_MEMBER_REGISTER:
+        copy_reduced_into_register(reduced, var->reg);
+        /* fallthrough */
+    case EXPR_MEMBER_SAVED:
+        copy_reduced_into_memory(reduced, scope->thisptr->reg, var->offset);
+        break;
+    }
+}
+
+void codegen_generate_expression_statement(struct tree *tree) {
+    if (scope->unreachable || !has_function_calls(tree)) {
+        return;
+    }
+    struct reduced reduced = reduce_tree(tree, ANY_REGISTER);
+    if (reduced.is_temp) {
+        freereg(reduced.reg);
+    }
+}
+
+struct tree *tree_new_immediate(long value) {
+    struct tree *tree = tree_new_operator(OP_IMMEDIATE, NULL, NULL);
+    tree->expr->value = value;
+    return tree;
+}
+
+struct tree *tree_new_variable(char const *name) {
+    struct tree *tree = tree_new_operator(0, NULL, NULL);
+    // This name will be used to resolve the actual variable expression later
+    // in the program flow.
+    tree->expr->varname = name;
+    return tree;
+}
+
+struct tree *tree_new_operator(enum op op, struct tree *left, struct tree *right) {
+    struct tree *tree = xalloc(sizeof(*tree));
+    *tree = (struct tree) {
+        .op    = op,
+        .left  = left,
+        .right = right,
+        .expr  = &tree->_expr_struct,
+    };
+    return tree;
+}
+
+struct tree *tree_new_operator_new(struct sym const *clazz) {
+    assert(clazz != NULL && clazz->symtype == SYMTYPE_CLASS && clazz->name != NULL);
+
+    int num_members = 0;
+    for (struct symtable *members = clazz->clazz.members; members != NULL; members = members->next) {
+        ++num_members;
+    }
+
+    struct tree *tree = tree_new_operator(OP_NEW, NULL, NULL);
+    tree->expr->varname = clazz->name;
+    tree->expr->value = num_members;
+    return tree;
+}
+
+struct tree *tree_new_function_call(const char *func_name, struct tree *param_tree) {
+    struct tree *t = tree_new_operator(OP_CALL, param_tree, NULL);
+    t->expr->varname = func_name;
+    return t;
+}

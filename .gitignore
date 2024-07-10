@@ -1,0 +1,7 @@
+*.s
+*.o
+/gesamt
+/oxout.*
+/parser.tab.*
+/lex.yy.c
+/codegen.c
